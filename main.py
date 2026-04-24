@@ -1,119 +1,114 @@
 import asyncio
-from playwright.async_api import async_playwright
+import os
 from datetime import datetime
+from playwright.async_api import async_playwright
 
-# --- НАСТРОЙКИ ---
-TARGET_CHATS = ["Timur Morozov", "Заказы Фриланс", "Работа IT", "МИР КРЕАТОРОВ"]
-CHECK_INTERVAL = 10 
+# --- КОНФИГУРАЦИЯ ---
+CONFIG = {
+    "TARGET_CHATS": ["Timur Morozov", "Заказы Фриланс", "Работа IT", "МИР КРЕАТОРОВ"],
+    "CHECK_INTERVAL": 5,  # Уменьшили интервал для более быстрой реакции
+    "USER_DATA_DIR": "user_data",
+    "SELECTORS": {
+        "chat_button": ".ListItem-button",
+        "unread_badge": ".tgKbsVmz, .chat-badge-transition span, .Badge.unread",
+        "scroll_btn": "button[aria-label='Go to bottom'], button[title='Go to bottom'], .scroll-down-button",
+        "messages": ".message-text, .text-content, .bubble-content",
+        "unread_sep": ".message-list-item:has-text('Unread Messages'), .message-list-item:has-text('Новые сообщения')"
+    }
+}
 
-async def check_telegram_connection(page):
-    try:
-        is_browser_online = await page.evaluate("window.navigator.onLine")
-        if not is_browser_online: return False
-        connecting_status = page.locator(".ConnectionStatus, .loading-indicator, .status-text")
-        if await connecting_status.is_visible():
-            status_text = await connecting_status.inner_text()
-            if any(word in status_text.lower() for word in ["connecting", "updating", "соединение", "обновление"]):
-                return False
-        return True
-    except: return False
+async def log(message):
+    print(f"[{datetime.now().strftime('%H:%M:%S')}] {message}")
+
+async def safe_scroll_to_bottom(page):
+    """Улучшенный скролл вниз без лишних движений"""
+    # Активируем окно кликом в безопасную зону (заголовок)
+    await page.mouse.click(600, 50)
+    
+    # Силовой проброс вниз через клавиши
+    for _ in range(2):
+        await page.keyboard.press("End")
+        await asyncio.sleep(0.3)
+    
+    # Проверка и нажатие кнопки "Вниз"
+    btn = page.locator(CONFIG["SELECTORS"]["scroll_btn"]).filter(visible=True).first
+    if await btn.is_visible():
+        await btn.click(force=True)
+    
+    # Финальный JS-скролл для подгрузки всех элементов
+    await page.evaluate("""
+        const el = document.querySelector('.MessageList, .messages-container, .Transition_slide-active .scrollable-alist');
+        if (el) el.scrollTo({ top: el.scrollHeight, behavior: 'auto' });
+    """)
 
 async def handle_unread_chat(page, chat_name):
     try:
-        chat_row = page.locator(".ListItem-button").filter(has_text=chat_name).first
-        if not await chat_row.is_visible(): return False
+        chat_locator = page.locator(CONFIG["SELECTORS"]["chat_button"]).filter(has_text=chat_name).first
+        if not await chat_locator.is_visible():
+            return
 
-        unread_badge = chat_row.locator(".tgKbsVmz, .chat-badge-transition span").first
-
-        if await unread_badge.is_visible():
-            badge_text = await unread_badge.inner_text()
+        badge = chat_locator.locator(CONFIG["SELECTORS"]["unread_badge"]).first
+        if await badge.is_visible():
+            badge_text = await badge.inner_text()
             count = int(''.join(filter(str.isdigit, badge_text)) or 1)
             
-            print(f"[*] [{datetime.now().strftime('%H:%M:%S')}] Чат '{chat_name}': {count} новых.")
-            
-            # 1. Заходим в чат
-            await chat_row.click(force=True)
-            await asyncio.sleep(1.5) 
+            await log(f"Чат '{chat_name}': {count} новых. Захожу...")
+            await chat_locator.click(force=True)
+            await asyncio.sleep(1) # Время на анимацию открытия
 
-            # --- УСИЛЕННЫЙ СКРОЛЛ (ФИКС) ---
-            # Активируем окно чата
-            await page.mouse.click(600, 400)
-            
-            # Нажимаем End трижды с микро-паузой (это заставляет движок TG прогрузить хвост)
-            for _ in range(3):
-                await page.keyboard.press("End")
-                await asyncio.sleep(0.2)
+            await safe_scroll_to_bottom(page)
+            await asyncio.sleep(1.5) # Ждем, пока сообщения "прочитаются"
 
-            # Проверяем ту самую кнопку из твоего инспектора
-            # Добавил еще один вариант селектора .was-unread .Button
-            scroll_btn = page.locator("button.Button.round[aria-label='Go to bottom'], .scroll-down-button").filter(visible=True).first
-            if await scroll_btn.is_visible():
-                await scroll_btn.click(force=True)
-                print(f"   [v] Нажата кнопка 'Вниз'")
+            # Сбор сообщений через разделитель
+            separator = page.locator(CONFIG["SELECTORS"]["unread_sep"]).last
+            msgs_locator = page.locator(CONFIG["SELECTORS"]["messages"])
             
-            # "Прокрутка колесиком" до упора через JS
-            await page.evaluate("""
-                const scrollable = document.querySelector('.MessageList, .messages-container, .Transition_slide-active .scrollable-alist');
-                if (scrollable) {
-                    scrollable.scrollTo({ top: scrollable.scrollHeight, behavior: 'smooth' });
-                }
-            """)
-            
-            # Критически важная пауза, чтобы "галочки" стали синими
-            await asyncio.sleep(2) 
-            # -------------------------------
+            if await separator.is_visible():
+                # Берем всё, что ниже плашки "Новые сообщения"
+                new_msgs = page.locator(f".message-list-item:below({CONFIG['SELECTORS']['unread_sep']}) {CONFIG['SELECTORS']['messages']}")
+                texts = await new_msgs.all_inner_texts()
+            else:
+                # Фоллбэк: берем последние N сообщений по счетчику
+                all_texts = await msgs_locator.all_inner_texts()
+                texts = all_texts[-count:] if all_texts else []
 
-            # 4. Собираем сообщения
-            msg_selectors = ".message-text, .text-content, .bubble-content"
-            messages = await page.query_selector_all(msg_selectors)
-            
-            if messages:
-                new_ones = messages[-count:]
-                print(f"\n>>> НОВЫЕ СООБЩЕНИЯ В '{chat_name}':")
-                for m in new_ones:
-                    text = (await m.inner_text()).strip()
-                    print(f"  > {text}")
-                print("-" * 40)
-            
-            # 5. Выходим через Escape
+            if texts:
+                print(f"\n>>> {chat_name.upper()}:")
+                for t in texts:
+                    print(f"  > {t.strip()[:200]}...") # Ограничили длину для чистоты консоли
+                print("-" * 30)
+
             await page.keyboard.press("Escape")
-            await asyncio.sleep(1) 
-            return True
-    except Exception: pass
-    return False
+            await asyncio.sleep(0.5)
+            
+    except Exception:
+        pass
 
 async def main():
     async with async_playwright() as p:
+        # Оптимизация: отключаем картинки для экономии трафика и скорости
         context = await p.chromium.launch_persistent_context(
-            'user_data', 
+            CONFIG["USER_DATA_DIR"],
             headless=False,
-            slow_mo=50
+            args=["--start-maximized", "--blink-settings=imagesEnabled=false"] 
         )
-        page = await context.new_page()
-        await page.goto('https://web.telegram.org/a/')
-
-        print("Загрузка (20 сек)...")
-        await asyncio.sleep(20)
         
-        print("--- МОНИТОРИНГ ЗАПУЩЕН ---")
+        page = context.pages[0]
+        await page.goto('https://web.telegram.org/a/')
+        await log("Ожидание загрузки (15 сек)...")
+        await asyncio.sleep(15)
 
         while True:
-            if not await check_telegram_connection(page):
-                await asyncio.sleep(5)
-                continue
-
-            for chat in TARGET_CHATS:
+            # Вместо простого цикла, проверяем только когда есть активность
+            for chat in CONFIG["TARGET_CHATS"]:
                 await handle_unread_chat(page, chat)
             
-            try:
-                await page.mouse.move(150, 400)
-                await page.mouse.wheel(0, 500)
-                await asyncio.sleep(1)
-                await page.mouse.wheel(0, -500)
-            except: pass
-
-            await asyncio.sleep(CHECK_INTERVAL)
+            await asyncio.sleep(CONFIG["CHECK_INTERVAL"])
 
 if __name__ == "__main__":
-    try: asyncio.run(main())
-    except KeyboardInterrupt: print("\nОстановлено.")
+    if not os.path.exists(CONFIG["USER_DATA_DIR"]):
+        os.makedirs(CONFIG["USER_DATA_DIR"])
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nОстановлено.")
