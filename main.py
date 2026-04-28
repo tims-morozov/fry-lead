@@ -19,7 +19,7 @@ CONFIG = {
         "unread_badge": ".tgKbsVmz, .chat-badge-transition span, .Badge.unread",
         "down_button": "button.Button.cxwA6gDO, .jump-down-button",
         "inner_unread": ".unviewed-count, .Badge.unread-count",
-        "chat_list_container": ".Transition_slide-active .MessageList"
+        "message_text": ".text-content, .message-text"
     }
 }
 
@@ -40,80 +40,99 @@ async def send_to_tg(chat_name, text):
     except Exception as e:
         await log(f"Ошибка связи: {e}")
 
+async def get_messages(page, count):
+    if count <= 0: return []
+    return await page.evaluate(f"""(count) => {{
+        const msgs = Array.from(document.querySelectorAll('.Message'));
+        return msgs.slice(-count).map(m => {{
+            const t = m.querySelector('.text-content, .message-text');
+            return t ? t.innerText.trim() : null;
+        }}).filter(x => x);
+    }}""", count)
+
 async def handle_unread_chat(page, chat_name):
     try:
+        # Ищем чат с коротким таймаутом, чтобы не виснуть
         chats = page.locator(CONFIG["SELECTORS"]["chat_button"])
         target_chat = None
-        for i in range(await chats.count()):
+        
+        chat_count = await chats.count()
+        for i in range(chat_count):
             current = chats.nth(i)
             title_el = current.locator('.title, h3').first
-            if await title_el.is_visible() and (await title_el.inner_text()).strip() == chat_name:
-                target_chat = current
-                break
+            try:
+                # Ждем текст заголовка не более 2 сек
+                if await title_el.is_visible(timeout=2000):
+                    title = (await title_el.inner_text()).strip()
+                    if title == chat_name:
+                        target_chat = current
+                        break
+            except: continue
         
         if not target_chat: return
+
+        # Проверяем бадж (не более 3 сек ожидания)
         badge = target_chat.locator(CONFIG["SELECTORS"]["unread_badge"]).first
-        
-        if await badge.is_visible():
-            count = int(''.join(filter(str.isdigit, await badge.inner_text())) or 1)
-            await log(f"[{chat_name}] Вижу {count}. Читаю...")
-            await target_chat.click()
-            await asyncio.sleep(2)
+        try:
+            if not await badge.is_visible(timeout=3000): return
+            badge_text = await badge.inner_text()
+            initial_count = int(''.join(filter(str.isdigit, badge_text)) or 1)
+        except: return
 
-            # 1. Сбор сообщений
-            messages = await page.evaluate(f"""(count) => {{
-                const msgs = Array.from(document.querySelectorAll('.Message'));
-                return msgs.slice(-count).map(m => {{
-                    const t = m.querySelector('.text-content, .message-text');
-                    return t ? t.innerText.trim() : null;
-                }}).filter(x => x);
-            }}""", count)
-            
-            for m in list(dict.fromkeys(messages)):
-                await send_to_tg(chat_name, m)
+        await log(f"[{chat_name}] Захожу (ожидаю {initial_count})...")
+        await target_chat.click()
+        await asyncio.sleep(1.5)
 
-            # 2. СИЛОВОЕ ПРОЧТЕНИЕ
-            # Прожимаем кнопку вниз
-            for _ in range(8):
-                btn = page.locator(CONFIG["SELECTORS"]["down_button"]).first
-                if await btn.is_visible():
-                    await btn.click(force=True)
-                    await asyncio.sleep(0.4)
-                else: break
+        # 1. Сбор основной пачки
+        inner_badge = page.locator(CONFIG["SELECTORS"]["inner_unread"]).first
+        real_count = initial_count
+        if await inner_badge.is_visible(timeout=2000):
+            real_count = int(''.join(filter(str.isdigit, await inner_badge.inner_text())) or initial_count)
 
-            # Скроллим сам контейнер сообщений в самый низ через JS
-            await page.evaluate("""() => {
-                const scrollable = document.querySelector('.MessageList.custom-scroll');
-                if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
-            }""")
+        messages = await get_messages(page, real_count)
+        for m in list(dict.fromkeys(messages)):
+            await send_to_tg(chat_name, m)
+
+        # 2. Быстрый спуск
+        btn = page.locator(CONFIG["SELECTORS"]["down_button"]).first
+        if await btn.is_visible(timeout=2000):
+            await btn.click(force=True)
+            await asyncio.sleep(0.5)
+
+        await page.evaluate("""() => {
+            const scrollable = document.querySelector('.MessageList.custom-scroll');
+            if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
+        }""")
+
+        # 3. Оптимизированная охота
+        for _ in range(3):
+            await page.keyboard.press("End")
+            await asyncio.sleep(0.8)
             
-            # Ждем исчезновения внутреннего баджа
-            read_confirmed = False
-            for _ in range(5):
-                await page.keyboard.press("End")
-                await asyncio.sleep(1.0)
-                inner = page.locator(CONFIG["SELECTORS"]["inner_unread"]).first
-                if not await inner.is_visible():
-                    read_confirmed = True
-                    break
-            
-            # 3. ЕСЛИ ВСЕ ЕЩЕ НЕ ПРОЧИТАНО — МЕНЮ
-            if not read_confirmed:
-                await log(f"[{chat_name}] Обычный скролл не помог. Жму 'Mark as Read'...")
-                await page.keyboard.press("Escape")
-                await asyncio.sleep(0.5)
-                await target_chat.click(button="right")
-                # Ищем пункт меню "Mark as read"
-                menu_item = page.locator(".context-menu-item:has-text('Mark as read'), .tgico-readall").first
-                if await menu_item.is_visible():
-                    await menu_item.click()
-            else:
-                await page.keyboard.press("Escape")
-            
-            await asyncio.sleep(1)
+            # Если бадж исчез — выходим немедленно
+            inner = page.locator(CONFIG["SELECTORS"]["inner_unread"]).first
+            if not await inner.is_visible(timeout=1000):
+                break
+                
+            # Если бадж все еще тут — добираем новые
+            try:
+                extra_text = await inner.inner_text()
+                extra_count = int(''.join(filter(str.isdigit, extra_text)) or 0)
+                if extra_count > 0:
+                    await log(f"[{chat_name}] Добор: {extra_count}")
+                    extra_msgs = await get_messages(page, extra_count)
+                    for em in list(dict.fromkeys(extra_msgs)):
+                        await send_to_tg(chat_name, em)
+            except: break
+
+        # Финальный выход
+        await page.keyboard.press("End")
+        await asyncio.sleep(1.0)
+        await page.keyboard.press("Escape")
+        await asyncio.sleep(0.5)
 
     except Exception as e:
-        await log(f"Ошибка: {e}")
+        await log(f"Ожидаемый пропуск в {chat_name}") # Ошибки таймаута теперь просто пропускают чат
         await page.keyboard.press("Escape")
 
 async def main():
@@ -121,7 +140,7 @@ async def main():
         context = await p.chromium.launch_persistent_context(CONFIG["USER_DATA_DIR"], headless=False)
         page = context.pages[0]
         await page.goto('https://web.telegram.org/a/')
-        await log("Система запущена. Режим: Гарантированное прочтение.")
+        await log("Парзер запущен. Режим: Скорость + Точность.")
         await asyncio.sleep(15)
         while True:
             for chat in CONFIG["TARGET_CHATS"]:
