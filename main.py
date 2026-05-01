@@ -1,151 +1,152 @@
-import asyncio
 import os
-import random
+import asyncio
 import requests
 import sqlite3
-from datetime import datetime
+import html
 from dotenv import load_dotenv
-from playwright.async_api import async_playwright
+from telethon import TelegramClient, events
 
+# 1. Загрузка конфигурации
 load_dotenv()
+API_ID = int(os.getenv("API_ID"))
+API_HASH = os.getenv("API_HASH")
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
-CONFIG = {
-    "TARGET_CHATS": ["Timur Morozov", "Чат веб-дизайнеров | Фигма | Тильда | Разборы работ", "Работа IT", "МИР КРЕАТОРОВ"],
-    "DAY_INTERVAL": (2.0, 4.0),
-    "USER_DATA_DIR": "user_data",
-    "SELECTORS": {
-        "chat_button": ".ListItem-button",
-        "unread_badge": ".tgKbsVmz, .chat-badge-transition span, .Badge.unread",
-        "down_button": "button.Button.cxwA6gDO, .jump-down-button",
-        "inner_unread": ".unviewed-count, .Badge.unread-count",
-        "message_text": ".text-content, .message-text"
-    }
-}
+TARGET_CHAT_NAMES = [
+    'МИР КРЕАТОРОВ', 
+    'Test Group Fry Lead',
+    'Чат веб-дизайнеров | Фигма | Тильда | Разборы работ'
+]
 
-async def log(msg): 
-    print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}")
+# --- База Данных ---
+def init_db():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS users (user_id INTEGER PRIMARY KEY)')
+    conn.commit()
+    conn.close()
 
-async def send_to_tg(chat_name, text):
-    try:
-        conn = sqlite3.connect('users.db')
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id FROM users WHERE is_active = 1')
-        users = cursor.fetchall()
-        conn.close()
-        for (user_id,) in users:
-            url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
-            payload = {"chat_id": user_id, "text": f"🚀 **НОВЫЙ ЗАКАЗ**\n📍 {chat_name}\n\n{text}", "parse_mode": "Markdown"}
-            requests.post(url, json=payload, timeout=10)
-    except Exception as e:
-        await log(f"Ошибка связи: {e}")
+def add_user(user_id):
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('INSERT OR IGNORE INTO users (user_id) VALUES (?)', (user_id,))
+    conn.commit()
+    conn.close()
 
-async def get_messages(page, count):
-    if count <= 0: return []
-    return await page.evaluate(f"""(count) => {{
-        const msgs = Array.from(document.querySelectorAll('.Message'));
-        return msgs.slice(-count).map(m => {{
-            const t = m.querySelector('.text-content, .message-text');
-            return t ? t.innerText.trim() : null;
-        }}).filter(x => x);
-    }}""", count)
+def get_all_users():
+    conn = sqlite3.connect('users.db')
+    cursor = conn.cursor()
+    cursor.execute('SELECT user_id FROM users')
+    ids = [row[0] for row in cursor.fetchall()]
+    conn.close()
+    return ids
 
-async def handle_unread_chat(page, chat_name):
-    try:
-        # Ищем чат с коротким таймаутом, чтобы не виснуть
-        chats = page.locator(CONFIG["SELECTORS"]["chat_button"])
-        target_chat = None
-        
-        chat_count = await chats.count()
-        for i in range(chat_count):
-            current = chats.nth(i)
-            title_el = current.locator('.title, h3').first
-            try:
-                # Ждем текст заголовка не более 2 сек
-                if await title_el.is_visible(timeout=2000):
-                    title = (await title_el.inner_text()).strip()
-                    if title == chat_name:
-                        target_chat = current
-                        break
-            except: continue
-        
-        if not target_chat: return
+init_db()
+client = TelegramClient('fry_lead_session', API_ID, API_HASH)
 
-        # Проверяем бадж (не более 3 сек ожидания)
-        badge = target_chat.locator(CONFIG["SELECTORS"]["unread_badge"]).first
+async def broadcast_order(text):
+    """Рассылка заказа пользователям и логирование факта отправки"""
+    users = get_all_users()
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+    
+    if not users:
+        print("[!] Рассылка невозможна: в базе нет активных пользователей.")
+        return
+
+    for user_id in users:
+        payload = {
+            "chat_id": user_id, 
+            "text": text, 
+            "parse_mode": "HTML", 
+            "disable_web_page_preview": True
+        }
         try:
-            if not await badge.is_visible(timeout=3000): return
-            badge_text = await badge.inner_text()
-            initial_count = int(''.join(filter(str.isdigit, badge_text)) or 1)
-        except: return
+            requests.post(url, json=payload, timeout=5)
+        except:
+            pass
+    
+    # Обобщенный лог без указания конкретных ID
+    print(f"[SENT] Заказ успешно разослан пользователям (всего: {len(users)})")
 
-        await log(f"[{chat_name}] Захожу (ожидаю {initial_count})...")
-        await target_chat.click()
-        await asyncio.sleep(1.5)
+async def process_message(event):
+    try:
+        sender_id = event.sender_id
+        if not sender_id: return
 
-        # 1. Сбор основной пачки
-        inner_badge = page.locator(CONFIG["SELECTORS"]["inner_unread"]).first
-        real_count = initial_count
-        if await inner_badge.is_visible(timeout=2000):
-            real_count = int(''.join(filter(str.isdigit, await inner_badge.inner_text())) or initial_count)
+        # Лог получения сообщения
+        chat = await event.get_chat()
+        chat_title = getattr(chat, 'title', 'Чат')
+        print(f"[RECEIVE] Получено новое сообщение из чата: {chat_title}")
 
-        messages = await get_messages(page, real_count)
-        for m in list(dict.fromkeys(messages)):
-            await send_to_tg(chat_name, m)
+        # Пытаемся получить никнейм
+        username = None
+        try:
+            sender = await event.get_sender()
+            if sender and hasattr(sender, 'username') and sender.username:
+                username = sender.username
+        except:
+            pass
 
-        # 2. Быстрый спуск
-        btn = page.locator(CONFIG["SELECTORS"]["down_button"]).first
-        if await btn.is_visible(timeout=2000):
-            await btn.click(force=True)
-            await asyncio.sleep(0.5)
+        # Формирование ссылки на сообщение
+        message_id = event.id
+        clean_chat_id = str(event.chat_id).replace("-100", "")
+        msg_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
 
-        await page.evaluate("""() => {
-            const scrollable = document.querySelector('.MessageList.custom-scroll');
-            if (scrollable) scrollable.scrollTop = scrollable.scrollHeight;
-        }""")
+        # Оформление строки клиента
+        if username:
+            user_link = f"https://t.me/{username}"
+            client_display = f"<a href='{user_link}'>@{username}</a>"
+        else:
+            client_display = f"<a href='{msg_link}'>[Профиль скрыт — перейти к сообщению в чате]</a>"
 
-        # 3. Оптимизированная охота
-        for _ in range(3):
-            await page.keyboard.press("End")
-            await asyncio.sleep(0.8)
-            
-            # Если бадж исчез — выходим немедленно
-            inner = page.locator(CONFIG["SELECTORS"]["inner_unread"]).first
-            if not await inner.is_visible(timeout=1000):
-                break
-                
-            # Если бадж все еще тут — добираем новые
-            try:
-                extra_text = await inner.inner_text()
-                extra_count = int(''.join(filter(str.isdigit, extra_text)) or 0)
-                if extra_count > 0:
-                    await log(f"[{chat_name}] Добор: {extra_count}")
-                    extra_msgs = await get_messages(page, extra_count)
-                    for em in list(dict.fromkeys(extra_msgs)):
-                        await send_to_tg(chat_name, em)
-            except: break
-
-        # Финальный выход
-        await page.keyboard.press("End")
-        await asyncio.sleep(1.0)
-        await page.keyboard.press("Escape")
-        await asyncio.sleep(0.5)
-
+        clean_text = html.escape(event.text or "")
+        
+        # Финальная верстка сообщения
+        notification = (
+            f"<b>🚀 НОВЫЙ ЗАКАЗ</b>\n\n"
+            f"👤 <b>Клиент:</b> {client_display}\n"
+            f"__________________________\n\n"
+            f"{clean_text}"
+        )
+        
+        await broadcast_order(notification)
+        
     except Exception as e:
-        await log(f"Ожидаемый пропуск в {chat_name}") # Ошибки таймаута теперь просто пропускают чат
-        await page.keyboard.press("Escape")
+        print(f"[ERROR] Ошибка при обработке сообщения: {e}")
 
 async def main():
-    async with async_playwright() as p:
-        context = await p.chromium.launch_persistent_context(CONFIG["USER_DATA_DIR"], headless=False)
-        page = context.pages[0]
-        await page.goto('https://web.telegram.org/a/')
-        await log("Парзер запущен. Режим: Скорость + Точность.")
-        await asyncio.sleep(15)
+    await client.start()
+    print("[INFO] Скрипт запущен в боевом режиме. Ожидание заказов...")
+    
+    async def check_bot_updates():
+        last_id = 0
         while True:
-            for chat in CONFIG["TARGET_CHATS"]:
-                await handle_unread_chat(page, chat)
-            await asyncio.sleep(random.uniform(*CONFIG["DAY_INTERVAL"]))
+            try:
+                res = requests.get(f"https://api.telegram.org/bot{BOT_TOKEN}/getUpdates?offset={last_id + 1}").json()
+                if res.get("ok"):
+                    for upd in res["result"]:
+                        last_id = upd["update_id"]
+                        if "message" in upd and upd["message"].get("text") == "/start":
+                            u_id = upd["message"]["from"]["id"]
+                            add_user(u_id)
+                            requests.post(f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage", 
+                                          json={"chat_id": u_id, "text": "✅ Бот запущен! Ожидайте новые заказы."})
+            except: pass
+            await asyncio.sleep(5)
 
-if __name__ == "__main__":
+    asyncio.create_task(check_bot_updates())
+
+    target_ids = []
+    async for dialog in client.iter_dialogs():
+        if dialog.name in TARGET_CHAT_NAMES:
+            target_ids.append(dialog.id)
+            print(f"[INFO] Мониторинг чата активен: {dialog.name}")
+
+    @client.on(events.NewMessage(chats=target_ids))
+    async def handler(event):
+        await process_message(event)
+
+    await client.run_until_disconnected()
+
+if __name__ == '__main__':
     asyncio.run(main())
