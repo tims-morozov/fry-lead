@@ -17,7 +17,7 @@ TARGET_CHAT_NAMES = [
 CATEGORIES = {
     # --- WEB DEVELOPMENT ---
     "NoCode": {
-        "name": "Конструкторы сайтов (Tilda/WP)",
+        "name": "Конструкторы сайтов",
         "keywords": ["тильд", "tilda", "вордпресс", "wordpress", "wp", "лендинг", "многостраничник", "интернет-магазин"],
         "weight": 1.0
     },
