@@ -84,7 +84,7 @@ def format_notification(username, msg_link, text, category_id):
     category_name = CATEGORIES.get(category_id, {}).get("name", category_id)
     
     # Ссылка на клиента или на сообщение, если профиль скрыт[cite: 1]
-    client_display = f"<a href='https://t.me/{username}'>@{username}</a>" if username else f"<a href='{msg_link}'>Профиль скрыт</a>"
+    client_display = f"<a href='https://t.me/{username}'>@{username}</a>" if username else f"<a href='{msg_link}'>Профиль скрыт - перейти к сообщению</a>"
     
     # Экранируем спецсимволы в тексте заказа[cite: 1]
     clean_text = html.escape(text or "")
@@ -117,32 +117,35 @@ async def broadcast_order(text, category_id, bot_token):
             })
 
 def classify_message(text):
-    """Определяет категорию с жесткой фильтрацией саморекламы из config.py[cite: 3, 4]."""
+    """Определяет категорию, учитывая количество совпадений и их вес (weight)."""
     text = text.lower()
     
-    # 1. ГЛОБАЛЬНЫЙ ФИЛЬТР (из config.py)
+    # 1. Глобальный фильтр стоп-слов
     from config import GLOBAL_STOP_WORDS
     if any(word.lower() in text for word in GLOBAL_STOP_WORDS):
         return None 
 
-    # 2. ЛОКАЛЬНЫЙ ФИЛЬТР (быстрые маркеры исполнителя)[cite: 3]
-    local_stop = ['ищу работу', 'резюме', 'портфолио', 'выполню', 'готов помочь']
-    if any(word in text for word in local_stop):
-        return None 
-
     best_category = None
-    max_score = 0
+    max_final_score = 0
 
-    # 3. ПОИСК КАТЕГОРИИ[cite: 3, 4]
+    # 2. Поиск с учетом весов
     for cat_id, info in CATEGORIES.items():
         keywords = info.get('keywords', [])
-        score = sum(1 for word in keywords if word in text)
+        weight = info.get('weight', 1.0)
         
-        if score > max_score:
-            max_score = score
+        matches = sum(1 for word in keywords if word in text)
+        
+        # Дополнительный бонус за уникальные технические термины[cite: 4]
+        if cat_id == "TWA" and ("twa" in text or "webapp" in text):
+            matches += 1 
+
+        final_score = matches * weight
+        
+        if final_score > max_final_score:
+            max_final_score = final_score
             best_category = cat_id
 
-    if max_score == 0:
+    if max_final_score == 0:
         return None
 
     return best_category
