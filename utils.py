@@ -117,9 +117,32 @@ async def broadcast_order(text, category_id, bot_token):
             })
 
 def classify_message(text):
-    """Определяет ID категории на основе ключевых слов из config.py[cite: 1]."""
+    """Определяет категорию с жесткой фильтрацией саморекламы из config.py[cite: 3, 4]."""
     text = text.lower()
+    
+    # 1. ГЛОБАЛЬНЫЙ ФИЛЬТР (из config.py)
+    from config import GLOBAL_STOP_WORDS
+    if any(word.lower() in text for word in GLOBAL_STOP_WORDS):
+        return None 
+
+    # 2. ЛОКАЛЬНЫЙ ФИЛЬТР (быстрые маркеры исполнителя)[cite: 3]
+    local_stop = ['ищу работу', 'резюме', 'портфолио', 'выполню', 'готов помочь']
+    if any(word in text for word in local_stop):
+        return None 
+
+    best_category = None
+    max_score = 0
+
+    # 3. ПОИСК КАТЕГОРИИ[cite: 3, 4]
     for cat_id, info in CATEGORIES.items():
-        if any(keyword in text for keyword in info.get('keywords', [])):
-            return cat_id
-    return None
+        keywords = info.get('keywords', [])
+        score = sum(1 for word in keywords if word in text)
+        
+        if score > max_score:
+            max_score = score
+            best_category = cat_id
+
+    if max_score == 0:
+        return None
+
+    return best_category

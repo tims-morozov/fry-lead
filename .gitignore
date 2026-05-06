@@ -3,3 +3,4 @@
 *.session-journal
 *.db
 __pycache__/
+instruction.txt
